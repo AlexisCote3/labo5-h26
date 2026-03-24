@@ -12,22 +12,27 @@
 #include <string.h>
 #include <unistd.h>
 #include <math.h>
+#include <stdlib.h>
+#include <sys/select.h>
 
 #include "utils.h"
 #include "emulateurClavier.h"
 #include "tamponCirculaire.h"
 
+#define TAILLE_BUFFER_LECTURE 4096
+#define EOT 0x4
 
 
 static void* threadFonctionClavier(void* args){
     // Implementez ici votre fonction de thread pour l'ecriture sur le bus USB
     // La premiere des choses est de recuperer les arguments (deja fait pour vous)
     struct infoThreadClavier *infos = (struct infoThreadClavier *)args;
+    struct requete req;
+    int ret;
 
     // Vous devez ensuite attendre sur la barriere passee dans les arguments
     // pour etre certain de commencer au meme moment que le thread lecteur
-
-    // TODO
+    pthread_barrier_wait(infos->barriere);
 
     // Finalement, ecrivez dans cette boucle la logique du thread, qui doit:
     // 1) Tenter d'obtenir une requete depuis le tampon circulaire avec consommerDonnee()
@@ -37,7 +42,13 @@ static void* threadFonctionClavier(void* args){
     //      la requete est maintenant terminee
 
     while(1){
-       // TODO
+        ret = consommerDonnee(&req);
+        if(ret == 1){
+            ecrireCaracteres(infos->pointeurClavier, req.data, req.taille, infos->tempsTraitementParCaractereMicroSecondes);
+            free(req.data);
+        } else {
+            usleep(500);
+        }
     }
     return NULL;
 }
@@ -52,10 +63,13 @@ static void* threadFonctionLecture(void *args){
     fd_set setFd;
     int nfds = infos->pipeFd + 1;
 
+    char buffer[TAILLE_BUFFER_LECTURE];
+    char *msgBuffer = NULL;
+    size_t msgLen = 0;
+
     // Vous devez ensuite attendre sur la barriere passee dans les arguments
     // pour etre certain de commencer au meme moment que le thread lecteur
-
-    // TODO
+    pthread_barrier_wait(infos->barriere);
 
     // Finalement, ecrivez dans cette boucle la logique du thread, qui doit:
     // 1) Remplir setFd en utilisant FD_ZERO et FD_SET correctement, pour faire en sorte
@@ -70,7 +84,38 @@ static void* threadFonctionLecture(void *args){
     //      la bonne valeur aux champs taille et tempsReception.
 
     while(1){
-        // TODO
+        FD_ZERO(&setFd);
+        FD_SET(infos->pipeFd, &setFd);
+
+        int selectRet = select(nfds, &setFd, NULL, NULL, NULL);
+        if(selectRet <= 0){
+            continue;
+        }
+
+        if(FD_ISSET(infos->pipeFd, &setFd)){
+            ssize_t nbLus = read(infos->pipeFd, buffer, sizeof(buffer));
+            if(nbLus <= 0){
+                continue;
+            }
+
+            for(ssize_t i = 0; i < nbLus; i++){
+                if(buffer[i] == EOT){
+                    if(msgLen > 0){
+                        struct requete req;
+                        req.data = msgBuffer;
+                        req.taille = msgLen;
+                        req.tempsReception = get_time();
+                        insererDonnee(&req);
+                    }
+                    msgBuffer = NULL;
+                    msgLen = 0;
+                } else {
+                    msgBuffer = realloc(msgBuffer, msgLen + 1);
+                    msgBuffer[msgLen] = buffer[i];
+                    msgLen++;
+                }
+            }
+        }
     }
     return NULL;
 }
@@ -78,6 +123,7 @@ static void* threadFonctionLecture(void *args){
 int main(int argc, char* argv[]){
     if(argc < 4){
         printf("Pas assez d'arguments! Attendu : ./emulateurClavier cheminPipe tempsAttenteParPaquet tailleTamponCirculaire\n");
+        return 1;
     }
 
     // A ce stade, vous pouvez consider que:
@@ -87,24 +133,49 @@ int main(int argc, char* argv[]){
     // argv[3] contient un entier valide (que vous pouvez convertir avec atoi()) contenant la taille voulue pour le tampon
     //      circulaire
 
+    unsigned int tempsAttente = (unsigned int)atoi(argv[2]);
+    int tailleTampon = atoi(argv[3]);
+
     // Vous avez plusieurs taches d'initialisation a faire :
     //
     // 1) Ouvrir le named pipe
-
-    // TODO
+    int pipeFd = open(argv[1], O_RDONLY);
+    if(pipeFd < 0){
+        perror("Erreur ouverture named pipe");
+        return 1;
+    }
 
     // 2) Declarer et initialiser la barriere
-    
-    // TODO
+    pthread_barrier_t barriere;
+    pthread_barrier_init(&barriere, NULL, 2);
 
     // 3) Initialiser le tampon circulaire avec la bonne taille
-
-    // TODO
+    if(initTamponCirculaire((size_t)tailleTampon) != 0){
+        fprintf(stderr, "Erreur initialisation tampon circulaire\n");
+        close(pipeFd);
+        return 1;
+    }
 
     // 4) Creer et lancer les threads clavier et lecteur, en leur passant les bons arguments dans leur struct de configuration respective
-    
-    // TODO
+    FILE* periphClavier = initClavier();
+    if(periphClavier == NULL){
+        fprintf(stderr, "Erreur initialisation clavier\n");
+        close(pipeFd);
+        return 1;
+    }
 
+    struct infoThreadClavier infosClavier;
+    infosClavier.pointeurClavier = periphClavier;
+    infosClavier.tempsTraitementParCaractereMicroSecondes = tempsAttente;
+    infosClavier.barriere = &barriere;
+
+    struct infoThreadLecture infosLecture;
+    infosLecture.pipeFd = pipeFd;
+    infosLecture.barriere = &barriere;
+
+    pthread_t threadClavier, threadLecture;
+    pthread_create(&threadClavier, NULL, threadFonctionClavier, &infosClavier);
+    pthread_create(&threadLecture, NULL, threadFonctionLecture, &infosLecture);
 
     // La boucle de traitement est deja implementee pour vous. Toutefois, si vous voulez eviter l'affichage des statistiques
     // (qui efface le terminal a chaque fois), vous pouvez commenter la ligne afficherStats().
